@@ -1,6 +1,243 @@
-streamlit
-pandas
-openai
-plotly
-openpyxl
-pypdf
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from openai import OpenAI
+from pypdf import PdfReader
+import io
+
+# --- CONFIGURATION ---
+st.set_page_config(page_title="EpiSight Platform", layout="wide", page_icon="🏥")
+
+# Attempt to initialize OpenAI Client using secrets
+try:
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+except:
+    st.error("🚨 Configuration Error: OpenAI API Key not found in Streamlit secrets.")
+    st.stop()
+
+# --- CSS FOR WEBSITE FEEL ---
+st.markdown("""
+<style>
+    .main { background-color: #f5f5f5; }
+    h1 { color: #006064; }
+    .stButton>button { border-radius: 5px; background-color: #008080; color: white; border: none; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- HELPER FUNCTIONS (Cleaning, Reporting, PDF) ---
+
+def extract_text_from_pdf(file):
+    # Function to extract text from a PDF file
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+def smart_clean_data(df):
+    # Automated data cleaning protocol
+    report = []
+    
+    # 1. Clean Headers (Snake Case)
+    old_cols = list(df.columns)
+    df.columns = [c.strip().lower().replace(' ', '_').replace('-', '_') for c in df.columns]
+    if list(df.columns) != old_cols:
+        report.append("✅ Standardized column headers (snake_case).")
+        
+    # 2. Remove Duplicates
+    duplicates = df.duplicated().sum()
+    if duplicates > 0:
+        df = df.drop_duplicates()
+        report.append(f"✅ Removed {duplicates} duplicate rows.")
+    
+    # 3. Handle Missing Values
+    num_cols = df.select_dtypes(include=['number']).columns
+    if len(num_cols) > 0:
+        for col in num_cols:
+            if df[col].isnull().sum() > 0:
+                median_val = df[col].median()
+                df[col] = df[col].fillna(median_val)
+                report.append(f"✅ Imputed missing values in '{col}' with median.")
+
+    cat_cols = df.select_dtypes(include=['object']).columns
+    if len(cat_cols) > 0:
+        df[cat_cols] = df[cat_cols].fillna("Unknown")
+        
+    return df, report
+
+def generate_canva_report(analysis_text, chart_html=None):
+    # Generates HTML with professional CSS (Canva-style)
+    html_template = f"""
+    <html>
+    <head>
+        <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap" rel="stylesheet">
+        <style>
+            body {{ font-family: 'Roboto', sans-serif; background-color: #f4f6f8; color: #333; margin: 0; padding: 40px; }}
+            .container {{ max-width: 900px; margin: auto; }}
+            .header {{ background: linear-gradient(135deg, #006064 0%, #00acc1 100%); color: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 20px rgba(0,0,0,0.1); margin-bottom: 30px; }}
+            .card {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 25px; }}
+            .card h2 {{ color: #006064; border-bottom: 2px solid #e0f7fa; padding-bottom: 10px; margin-top: 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header"><h1>EpiSight M&E Report</h1></div>
+            <div class="card">
+                <h2>Key Findings & Summary</h2>
+                <p>{analysis_text.replace(chr(10), '<br>')}</p>
+            </div>
+            <div class="card">
+                <h2>Data Visualization</h2>
+                <div style="width:100%; overflow:hidden;">
+                    {chart_html if chart_html else "<p>No charts generated for this session.</p>"}
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_template
+
+
+# --- GLOBAL STATE & NAVIGATION ---
+if "data" not in st.session_state:
+    st.session_state["data"] = None
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [{"role": "system", "content": "You are EpiSight. See system prompt."}]
+
+# Sidebar Navigation
+st.sidebar.title("🏥 EpiSight Portal")
+page = st.sidebar.radio("Navigate", ["📂 Data Ingestion", "🧹 Data Cleaning", "📊 Analysis & Chat", "📝 Report Designer"])
+
+# --- PAGE LOGIC ---
+
+# 1. DATA INGESTION TAB
+if page == "📂 Data Ingestion":
+    st.title("Data Ingestion & Setup")
+    st.info("Upload your raw M&E data (CSV, Excel, or PDF).")
+
+    uploaded_file = st.file_uploader("Drop files here", type=['csv', 'xlsx', 'pdf'])
+    
+    if uploaded_file:
+        file_ext = uploaded_file.name.split(".")[-1]
+        
+        if file_ext == "csv":
+            st.session_state["data"] = pd.read_csv(uploaded_file)
+            st.success(f"Loaded CSV: {len(st.session_state['data'])} records.")
+        elif file_ext == "xlsx":
+            st.session_state["data"] = pd.read_excel(uploaded_file)
+            st.success(f"Loaded Excel: {len(st.session_state['data'])} records.")
+        elif file_ext == "pdf":
+            text_data = extract_text_from_pdf(uploaded_file)
+            st.session_state["raw_text"] = text_data
+            st.success("PDF Text Extracted. Use the 'Analysis' tab to query the text.")
+        
+        if st.session_state["data"] is not None:
+             st.subheader("Data Preview (First 5 Rows)")
+             st.dataframe(st.session_state["data"].head())
+
+
+# 2. DATA CLEANING TAB
+elif page == "🧹 Data Cleaning":
+    st.title("Smart Data Cleaning Protocol")
+    
+    if st.session_state["data"] is not None:
+        st.subheader("Current Data Status")
+        st.dataframe(st.session_state["data"].head())
+        
+        if st.button("✨ Run Auto-Clean Protocol", key="clean_button"):
+            with st.spinner("Cleaning in progress..."):
+                cleaned_df, clean_log = smart_clean_data(st.session_state["data"].copy())
+                st.session_state["data"] = cleaned_df
+                st.success("Data Cleaning Complete!")
+                
+                st.subheader("Cleaning Summary")
+                for log_item in clean_log:
+                    st.markdown(f"- {log_item}")
+                st.info("The cleaned data is now active for analysis.")
+        
+        st.subheader("Statistics Summary")
+        st.dataframe(st.session_state["data"].describe())
+
+    else:
+        st.warning("Please upload data first in the 'Data Ingestion' tab.")
+
+
+# 3. ANALYSIS & CHAT TAB
+elif page == "📊 Analysis & Chat":
+    st.title("AI Analyst Chat")
+    st.info("Ask any M&E or Public Health questions about your **current** data.")
+
+    # Display chat history
+    for msg in st.session_state.messages:
+        if msg["role"] != "system":
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    # User Input
+    if prompt := st.chat_input("Analyze trends, calculate prevalence, or ask for a report..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            
+            # Prepare context for the AI
+            data_context = ""
+            if st.session_state["data"] is not None:
+                df = st.session_state["data"]
+                data_context = f"DATA CONTEXT: Columns: {list(df.columns)}. Sample Data: {df.head(3).to_string()}."
+            elif "raw_text" in st.session_state:
+                data_context = f"DOCUMENT CONTEXT: {st.session_state['raw_text'][:1500]}..." # Truncate
+
+            full_prompt = f"{data_context}\n\nUser Request: {prompt}"
+            
+            response = client.chat.completions.create(
+                model="gpt-4o", 
+                messages=[
+                    {"role": "system", "content": "You are EpiSight. Use the data context provided to answer."},
+                    {"role": "user", "content": full_prompt}
+                ]
+            )
+            ai_reply = response.choices[0].message.content
+            message_placeholder.markdown(ai_reply)
+            st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+
+
+# 4. REPORT DESIGNER TAB
+elif page == "📝 Report Designer":
+    st.title("Canva-Style Report Generation")
+    
+    if st.session_state["data"] is not None and len(st.session_state["messages"]) > 1:
+        st.info("Generating a report based on the last AI analysis in the chat tab.")
+        
+        # Get the last AI message
+        analysis_text = next((msg['content'] for msg in reversed(st.session_state.messages) if msg['role'] == 'assistant'), "No analysis found.")
+        
+        st.subheader("Report Configuration")
+        title = st.text_input("Report Title", "Monthly M&E Update")
+        theme = st.selectbox("Design Theme", ["Modern Teal (Default)", "Academic Grey", "Urgent Red"])
+        
+        if st.button("📄 Finalize & Download Report"):
+            chart_html = ""
+            # Simple chart example for report
+            num_cols = st.session_state["data"].select_dtypes(include='number').columns
+            if len(num_cols) >= 2:
+                fig = px.scatter(st.session_state["data"], x=num_cols[0], y=num_cols[1], 
+                                 title=f"Key Metric Correlation: {num_cols[1]} vs. {num_cols[0]}", template="plotly_white")
+                chart_html = fig.to_html(full_html=False)
+
+            report_html = generate_canva_report(analysis_text, chart_html)
+            
+            st.download_button(
+                label="📥 Download Designed Report (HTML)",
+                data=report_html,
+                file_name=f"{title.replace(' ', '_')}.html",
+                mime="text/html"
+            )
+            st.balloons()
+            
+    else:
+        st.warning("Please analyze your data in the 'Analysis & Chat' tab first to generate content for the report.")
