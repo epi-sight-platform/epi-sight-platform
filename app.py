@@ -1,21 +1,28 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from openai import OpenAI
 from pypdf import PdfReader
 import io
+
+# --- GOOGLE GENAI CLIENT IMPORT ---
+try:
+    from google import genai
+    # Define the model to use
+    MODEL = "gemini-2.5-flash" 
+except ImportError:
+    st.error("🚨 Required library 'google-genai' not found. Please ensure it is installed.")
+    st.stop()
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="EpiSight Platform", layout="wide", page_icon="🏥")
 
-# Attempt to initialize OpenAI Client using secrets
-# This is the section that requires the OPENAI_API_KEY in the Streamlit secrets
+# Attempt to initialize Gemini Client using secrets
 try:
-    # Use 'gpt-4o' for the client initialization
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    # REQUIRES: The GEMINI_API_KEY must be set in the Streamlit secrets.toml file.
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 except Exception as e:
-    st.error(f"🚨 Configuration Error: OpenAI API Key not found or invalid. Please check Streamlit secrets.")
-    st.stop()
+    st.error(f"🚨 Configuration Error: Gemini API Key not found or invalid. Please check Streamlit secrets.")
+    st.stop() 
 
 # --- CSS FOR WEBSITE FEEL ---
 st.markdown("""
@@ -24,7 +31,7 @@ st.markdown("""
     .main { background-color: #f5f5f5; }
     /* Primary headline color (Teal) */
     h1 { color: #006064; }
-    /* Style for main buttons */
+    /* Style for main buttons (Enhanced CSS for better look) */
     .stButton>button { 
         border-radius: 5px; 
         background-color: #008080; 
@@ -53,6 +60,7 @@ def extract_text_from_pdf(file):
         reader = PdfReader(file)
         text = ""
         for page in reader.pages:
+            # Safely handle pages with no extractable text
             text += page.extract_text() or ""
         return text
     except Exception as e:
@@ -69,7 +77,7 @@ def smart_clean_data(df):
         c.strip().lower()
         .replace(' ', '_')
         .replace('-', '_')
-        .replace('(', '')
+        .replace('(', '') 
         .replace(')', '')
         for c in df.columns
     ]
@@ -136,7 +144,7 @@ def generate_canva_report(title, analysis_text, chart_html=None):
         <div class="container">
             <div class="header"><h1>{title}</h1></div>
             <div class="card">
-                <h2>Key Findings & Summary</h2>
+                <h2>Key Findings & Summary </h2>
                 <div class="analysis-text">{analysis_text.replace(chr(10), '<br>')}</div>
             </div>
             <div class="card">
@@ -158,15 +166,18 @@ if "data" not in st.session_state:
 if "raw_text" not in st.session_state:
     st.session_state["raw_text"] = None
 
-if "messages" not in st.session_state:
-    # System message to guide the AI's persona and objective
-    system_prompt = (
+if "system_instruction" not in st.session_state:
+    st.session_state["system_instruction"] = (
         "You are EpiSight, an expert monitoring and evaluation (M&E) and public health data analyst. "
         "Your responses must be concise, professional, and directly address the user's request using "
         "the provided DATA CONTEXT or DOCUMENT CONTEXT. If no data is available, politely state that you need data to proceed. "
         "If you generate analysis, keep the output readable and formatted with markdown."
     )
-    st.session_state["messages"] = [{"role": "system", "content": system_prompt}]
+
+if "messages" not in st.session_state:
+    # Chat history only stores user/assistant turns for display
+    st.session_state["messages"] = []
+
 
 # Sidebar Navigation
 st.sidebar.title("🏥 EpiSight Portal")
@@ -247,45 +258,70 @@ elif page == "📊 Analysis & Chat":
     else:
         st.info("Ask any M&E or Public Health questions about your uploaded data/document.")
 
-    # Display chat history
+    # Display chat history 
     for msg in st.session_state.messages:
-        if msg["role"] != "system":
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
     # User Input
     if prompt := st.chat_input("Analyze trends, calculate prevalence, or ask for a report..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user input immediately
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             
-            # Prepare context for the AI
+            # 1. Prepare context for the AI
             data_context = ""
             if st.session_state["data"] is not None:
                 df = st.session_state["data"]
-                data_context = f"DATA CONTEXT: The dataset has {len(df)} rows. Columns: {list(df.columns)}. Data types: {df.dtypes.to_dict()}. Sample Data: {df.head(5).to_string()}."
-            elif st.session_state["raw_text"] is not None:
-                # Truncate text context for API call efficiency
-                data_context = f"DOCUMENT CONTEXT: The uploaded document text is: {st.session_state['raw_text'][:4000]}..."
-
-            full_prompt = f"Data Analyst Request: {prompt}\n\n{data_context}"
-            
-            # Call the OpenAI API
-            try:
-                response = client.chat.completions.create(
-                    model="gpt-4o", 
-                    messages=[
-                        # System message is automatically the first message in the session state
-                        *st.session_state.messages,
-                        {"role": "user", "content": full_prompt}
-                    ]
+                # Limit the sample data string size to prevent token overload
+                sample_data_string = df.head(5).to_string()[:2000] 
+                data_context = (
+                    f"DATA CONTEXT: The dataset has {len(df)} rows. Columns: {list(df.columns)}. "
+                    f"Data types: {df.dtypes.to_dict()}. Sample Data (First 5 Rows): {sample_data_string}."
                 )
-                ai_reply = response.choices[0].message.content
+            elif st.session_state["raw_text"] is not None:
+                # Truncate document context for API call efficiency
+                doc_text = st.session_state['raw_text']
+                data_context = f"DOCUMENT CONTEXT: The uploaded document text is: {doc_text[:4000]}..."
+
+            # 2. Construct the full prompt with the context for the API call
+            full_prompt_with_context = f"Data Analyst Request: {prompt}\n\n{data_context}"
+            
+            # 3. Construct the full message list for the API (mapping Streamlit roles to Gemini roles)
+            gemini_contents = []
+            
+            # Add existing history
+            for msg in st.session_state.messages:
+                # 'assistant' role in Streamlit maps to 'model' role in Gemini
+                role = "user" if msg["role"] == "user" else "model"
+                gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+            
+            # Add the current user message (with context)
+            gemini_contents.append({"role": "user", "parts": [{"text": full_prompt_with_context}]})
+            
+            # 4. Call the Gemini API
+            try:
+                with st.spinner("EpiSight Analyst is processing..."):
+                    
+                    response = client.models.generate_content(
+                        model=MODEL,
+                        contents=gemini_contents,
+                        config={
+                            "system_instruction": st.session_state["system_instruction"]
+                        }
+                    )
+                
+                ai_reply = response.text
                 message_placeholder.markdown(ai_reply)
+                
+                # 5. Update session history with clean prompts (NO data context)
+                st.session_state.messages.append({"role": "user", "content": prompt})
                 st.session_state.messages.append({"role": "assistant", "content": ai_reply})
+                
             except Exception as e:
                 st.error(f"An error occurred during AI generation. Please check your API key and connection: {e}")
 
@@ -295,12 +331,13 @@ elif page == "📝 Report Designer":
     st.title("Canva-Style Report Generation")
     
     # Check if we have data and at least one AI response to base the report on
-    analysis_messages = [msg['content'] for msg in st.session_state.messages if msg['role'] == 'assistant' and 'DATA CONTEXT' not in msg['content']]
+    # We only care about the assistant's generated text, not the system message.
+    analysis_messages = [msg['content'] for msg in st.session_state.messages if msg['role'] == 'assistant']
     
     if st.session_state["data"] is not None and len(analysis_messages) > 0:
         st.info("Generating a report based on the most recent AI analysis of your data.")
         
-        # Get the most recent non-system AI message for the summary text
+        # Get the most recent assistant message for the summary text
         analysis_text = analysis_messages[-1] 
         
         st.subheader("Report Configuration")
@@ -320,7 +357,8 @@ elif page == "📝 Report Designer":
             count_col = st.selectbox("Select Categorical Column for Counts:", cat_cols)
             if count_col:
                 count_data = df[count_col].value_counts().reset_index()
-                count_data.columns = [count_col, 'Count']
+                # Rename columns appropriately for plotly
+                count_data.columns = [count_col, 'Count'] 
                 fig = px.bar(count_data, x=count_col, y='Count', 
                              title=f"Count of Records by {count_col}", color='Count', template="plotly_white")
                 chart_html = fig.to_html(full_html=False)
